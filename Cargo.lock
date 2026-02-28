@@ -2121,6 +2121,7 @@ dependencies = [
  "lazy_static",
  "litesvm",
  "log",
+ "omnipair-amm-sdk",
  "paste",
  "program-interfaces",
  "regex",
@@ -2515,6 +2516,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "omnipair-amm-sdk"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "anchor-lang",
+ "anyhow",
+ "borsh 0.10.4",
+ "jupiter-amm-interface",
+ "rust_decimal",
+ "solana-commitment-config",
+ "solana-rpc-client",
+ "solana-sdk",
 ]
 
 [[package]]

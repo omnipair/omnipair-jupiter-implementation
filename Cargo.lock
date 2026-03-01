@@ -2521,16 +2521,14 @@ dependencies = [
 [[package]]
 name = "omnipair-amm-sdk"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec60e0d87797132ec99f6e366dd3fe2d74bb6d5816424889c3f49efd0f5d6188"
 dependencies = [
- "ahash 0.8.12",
  "anchor-lang",
  "anyhow",
  "borsh 0.10.4",
  "jupiter-amm-interface",
  "rust_decimal",
- "solana-commitment-config",
- "solana-rpc-client",
- "solana-sdk",
 ]
 
 [[package]]

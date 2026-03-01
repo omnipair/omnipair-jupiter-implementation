@@ -14,8 +14,6 @@ pub const TOKEN_2022_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 const BPS_DENOMINATOR: u128 = 10_000;
-#[allow(dead_code)]
-const PAIR_SEED_PREFIX: &[u8] = b"gamm_pair";
 const RESERVE_VAULT_SEED_PREFIX: &[u8] = b"reserve_vault";
 const FUTARCHY_AUTHORITY_SEED_PREFIX: &[u8] = b"futarchy_authority";
 
@@ -41,6 +39,10 @@ impl std::fmt::Display for OmnipairError {
         write!(f, "{:?}", self)
     }
 }
+
+// ---------------------------------------------------------------------------
+// On-chain state structs (deserialization only)
+// ---------------------------------------------------------------------------
 
 #[derive(AnchorDeserialize, Debug, Clone, Copy, Default)]
 pub struct VaultBumps {
@@ -90,8 +92,18 @@ pub struct OmnipairPair {
     pub reduce_only: bool,
 }
 
+// ---------------------------------------------------------------------------
+// SDK quote logic -- mirrors on-chain swap math from omnipair
+// ---------------------------------------------------------------------------
+
+pub struct SwapQuote {
+    pub amount_out: u64,
+    pub fee_amount: u64,
+}
+
 impl OmnipairPair {
-    fn calculate_amount_out(
+    /// Constant-product swap: Δy = (Δx * y) / (x + Δx)
+    pub fn calculate_amount_out(
         reserve_in: u64,
         reserve_out: u64,
         amount_in: u64,
@@ -106,12 +118,89 @@ impl OmnipairPair {
             .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?;
         Ok(amount_out as u64)
     }
+
+    /// Full swap quote: applies fee then constant-product, checks cash reserve.
+    pub fn swap_quote(&self, amount_in: u64, input_mint: Pubkey) -> Result<SwapQuote> {
+        let is_token0_in = input_mint == self.token0;
+        if !is_token0_in && input_mint != self.token1 {
+            bail!(OmnipairError::InvalidQuoteParams);
+        }
+
+        let (reserve_in, reserve_out, cash_reserve_out) = if is_token0_in {
+            (self.reserve0, self.reserve1, self.cash_reserve1)
+        } else {
+            (self.reserve1, self.reserve0, self.cash_reserve0)
+        };
+
+        if reserve_in == 0 || reserve_out == 0 {
+            bail!(OmnipairError::InvalidReserves);
+        }
+
+        let fee_amount = ceil_div(
+            (amount_in as u128)
+                .checked_mul(self.swap_fee_bps as u128)
+                .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?,
+            BPS_DENOMINATOR,
+        )
+        .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))? as u64;
+
+        let amount_in_after_fee = amount_in
+            .checked_sub(fee_amount)
+            .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?;
+
+        let amount_out = Self::calculate_amount_out(reserve_in, reserve_out, amount_in_after_fee)?;
+
+        if amount_out > cash_reserve_out {
+            bail!(OmnipairError::InsufficientCashReserve);
+        }
+
+        Ok(SwapQuote { amount_out, fee_amount })
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Derived accounts -- computed once from pair state, reused across calls
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct DerivedAccounts {
+    reserve_vault0: Pubkey,
+    reserve_vault1: Pubkey,
+    futarchy_authority: Pubkey,
+    event_authority: Pubkey,
+}
+
+impl DerivedAccounts {
+    fn compute(pair_key: &Pubkey, state: &OmnipairPair) -> Self {
+        let (reserve_vault0, _) = Pubkey::find_program_address(
+            &[RESERVE_VAULT_SEED_PREFIX, pair_key.as_ref(), state.token0.as_ref()],
+            &OMNIPAIR_PROGRAM_ID,
+        );
+        let (reserve_vault1, _) = Pubkey::find_program_address(
+            &[RESERVE_VAULT_SEED_PREFIX, pair_key.as_ref(), state.token1.as_ref()],
+            &OMNIPAIR_PROGRAM_ID,
+        );
+        let (futarchy_authority, _) = Pubkey::find_program_address(
+            &[FUTARCHY_AUTHORITY_SEED_PREFIX],
+            &OMNIPAIR_PROGRAM_ID,
+        );
+        let (event_authority, _) = Pubkey::find_program_address(
+            &[b"__event_authority"],
+            &OMNIPAIR_PROGRAM_ID,
+        );
+        Self { reserve_vault0, reserve_vault1, futarchy_authority, event_authority }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Jupiter Amm implementation -- thin wrapper that delegates to OmnipairPair
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct OmnipairAmmClient {
     pub pair_key: Pubkey,
     pub state: OmnipairPair,
+    derived: DerivedAccounts,
 }
 
 impl AmmProgramIdToLabel for OmnipairAmmClient {
@@ -119,7 +208,23 @@ impl AmmProgramIdToLabel for OmnipairAmmClient {
         &[(OMNIPAIR_PROGRAM_ID, "Omnipair")];
 }
 
+fn deserialize_pair(data: &[u8]) -> Result<OmnipairPair> {
+    if data.len() < 8 {
+        bail!(OmnipairError::InvalidAccountData);
+    }
+    Ok(OmnipairPair::deserialize(&mut &data[8..])?)
+}
+
 impl Amm for OmnipairAmmClient {
+    fn from_keyed_account(keyed_account: &KeyedAccount, _amm_context: &AmmContext) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let state = deserialize_pair(&keyed_account.account.data)?;
+        let derived = DerivedAccounts::compute(&keyed_account.key, &state);
+        Ok(Self { pair_key: keyed_account.key, state, derived })
+    }
+
     fn label(&self) -> String {
         "Omnipair".to_string()
     }
@@ -144,14 +249,8 @@ impl Amm for OmnipairAmmClient {
         let pair_account = account_map.get(&self.pair_key).with_context(|| {
             format!("Pair account not found for key: {}", self.pair_key)
         })?;
-
-        if pair_account.data.len() < 8 {
-            bail!(OmnipairError::InvalidAccountData);
-        }
-
-        let pair_data = OmnipairPair::deserialize(&mut &pair_account.data[8..])?;
-        self.state = pair_data;
-
+        self.state = deserialize_pair(&pair_account.data)?;
+        self.derived = DerivedAccounts::compute(&self.pair_key, &self.state);
         Ok(())
     }
 
@@ -159,125 +258,47 @@ impl Amm for OmnipairAmmClient {
         14
     }
 
-    fn from_keyed_account(keyed_account: &KeyedAccount, _amm_context: &AmmContext) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        if keyed_account.account.data.len() < 8 {
-            bail!(OmnipairError::InvalidAccountData);
-        }
-
-        let pair_data = OmnipairPair::deserialize(&mut &keyed_account.account.data[8..])?;
-
-        Ok(Self {
-            pair_key: keyed_account.key,
-            state: pair_data,
-        })
-    }
-
     fn quote(&self, quote_params: &jupiter_amm_interface::QuoteParams) -> Result<Quote> {
         if quote_params.swap_mode == SwapMode::ExactOut {
             bail!(OmnipairError::ExactOutNotSupported);
         }
 
-        let is_token0_in = quote_params.input_mint == self.state.token0;
-        if !is_token0_in && quote_params.input_mint != self.state.token1 {
-            bail!(OmnipairError::InvalidQuoteParams);
-        }
-
-        let (reserve_in, reserve_out, cash_reserve_out) = if is_token0_in {
-            (self.state.reserve0, self.state.reserve1, self.state.cash_reserve1)
-        } else {
-            (self.state.reserve1, self.state.reserve0, self.state.cash_reserve0)
-        };
-
-        if reserve_in == 0 || reserve_out == 0 {
-            bail!(OmnipairError::InvalidReserves);
-        }
-
-        let amount_in = quote_params.amount;
-
-        let swap_fee = ceil_div(
-            (amount_in as u128)
-                .checked_mul(self.state.swap_fee_bps as u128)
-                .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?,
-            BPS_DENOMINATOR,
-        )
-        .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))? as u64;
-
-        let amount_in_after_fee = amount_in
-            .checked_sub(swap_fee)
-            .ok_or_else(|| anyhow::anyhow!(OmnipairError::MathOverflow))?;
-
-        let amount_out =
-            OmnipairPair::calculate_amount_out(reserve_in, reserve_out, amount_in_after_fee)?;
-
-        if amount_out > cash_reserve_out {
-            bail!(OmnipairError::InsufficientCashReserve);
-        }
-
-        let fee_pct = Decimal::new(self.state.swap_fee_bps as i64, 4);
+        let result = self.state.swap_quote(quote_params.amount, quote_params.input_mint)?;
 
         Ok(Quote {
-            in_amount: amount_in,
-            out_amount: amount_out,
-            fee_amount: swap_fee,
+            in_amount: quote_params.amount,
+            out_amount: result.amount_out,
+            fee_amount: result.fee_amount,
             fee_mint: quote_params.input_mint,
-            fee_pct,
+            fee_pct: Decimal::new(self.state.swap_fee_bps as i64, 4),
         })
     }
 
     fn get_swap_and_account_metas(&self, swap_params: &SwapParams) -> Result<SwapAndAccountMetas> {
-        let SwapParams {
-            source_mint,
-            destination_mint,
-            destination_token_account,
-            source_token_account,
-            token_transfer_authority,
-            ..
-        } = swap_params;
+        let is_token0_in = swap_params.source_mint == self.state.token0;
 
-        let is_token0_in = *source_mint == self.state.token0;
-
-        let (token_in_mint, token_out_mint) = if is_token0_in {
-            (self.state.token0, self.state.token1)
+        let (token_in_mint, token_out_mint, token_in_vault, token_out_vault) = if is_token0_in {
+            (self.state.token0, self.state.token1, self.derived.reserve_vault0, self.derived.reserve_vault1)
         } else {
-            (self.state.token1, self.state.token0)
+            (self.state.token1, self.state.token0, self.derived.reserve_vault1, self.derived.reserve_vault0)
         };
-
-        let (token_in_vault, _) = Pubkey::find_program_address(
-            &[RESERVE_VAULT_SEED_PREFIX, self.pair_key.as_ref(), token_in_mint.as_ref()],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        let (token_out_vault, _) = Pubkey::find_program_address(
-            &[RESERVE_VAULT_SEED_PREFIX, self.pair_key.as_ref(), token_out_mint.as_ref()],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        let (futarchy_authority, _) = Pubkey::find_program_address(
-            &[FUTARCHY_AUTHORITY_SEED_PREFIX],
-            &OMNIPAIR_PROGRAM_ID,
-        );
-        let (event_authority, _) = Pubkey::find_program_address(
-            &[b"__event_authority"],
-            &OMNIPAIR_PROGRAM_ID,
-        );
 
         Ok(SwapAndAccountMetas {
             swap: Swap::TokenSwap,
             account_metas: OmnipairSwapAccounts {
                 pair: self.pair_key,
                 rate_model: self.state.rate_model,
-                futarchy_authority,
+                futarchy_authority: self.derived.futarchy_authority,
                 token_in_vault,
                 token_out_vault,
-                user_token_in_account: *source_token_account,
-                user_token_out_account: *destination_token_account,
+                user_token_in_account: swap_params.source_token_account,
+                user_token_out_account: swap_params.destination_token_account,
                 token_in_mint,
                 token_out_mint,
-                user: *token_transfer_authority,
+                user: swap_params.token_transfer_authority,
                 token_program: SPL_TOKEN_PROGRAM_ID,
                 token_2022_program: TOKEN_2022_PROGRAM_ID,
-                event_authority,
+                event_authority: self.derived.event_authority,
                 omnipair_program: OMNIPAIR_PROGRAM_ID,
             }
             .into(),
@@ -288,6 +309,10 @@ impl Amm for OmnipairAmmClient {
         Box::new(self.clone())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Swap account metas
+// ---------------------------------------------------------------------------
 
 pub struct OmnipairSwapAccounts {
     pub pair: Pubkey,
@@ -326,6 +351,10 @@ impl From<OmnipairSwapAccounts> for Vec<AccountMeta> {
         ]
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -372,23 +401,10 @@ mod tests {
             reduce_only: false,
         };
 
-        let client = OmnipairAmmClient {
-            pair_key: Pubkey::new_unique(),
-            state: pair.clone(),
-        };
+        let result = pair.swap_quote(1_000_000, pair.token0).unwrap();
 
-        let quote = client
-            .quote(&jupiter_amm_interface::QuoteParams {
-                amount: 1_000_000,
-                input_mint: pair.token0,
-                output_mint: pair.token1,
-                swap_mode: SwapMode::ExactIn,
-            })
-            .unwrap();
-
-        assert_eq!(quote.fee_amount, 3000);
-        assert_eq!(quote.out_amount, 996006);
-        assert_eq!(quote.in_amount, 1_000_000);
+        assert_eq!(result.fee_amount, 3000);
+        assert_eq!(result.amount_out, 996006);
     }
 
     /// Test against a live on-chain Omnipair Pair account.
@@ -452,6 +468,13 @@ mod tests {
         println!("  bump:            {}", amm.state.bump);
         println!("  version:         {}", amm.state.version);
         println!("  reduce_only:     {}", amm.state.reduce_only);
+
+        // -- Derived accounts (computed once in from_keyed_account) --
+        println!("\n=== Derived Accounts (pre-computed) ===");
+        println!("  reserve_vault0:      {}", amm.derived.reserve_vault0);
+        println!("  reserve_vault1:      {}", amm.derived.reserve_vault1);
+        println!("  futarchy_authority:  {}", amm.derived.futarchy_authority);
+        println!("  event_authority:     {}", amm.derived.event_authority);
 
         // -- Update --
         println!("\n=== Update (re-fetch) ===");
